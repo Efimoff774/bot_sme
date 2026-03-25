@@ -1,0 +1,34 @@
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Node
+node_modules/
+npm-cache/
+.yarn/
+
+# Next.js / Vercel
+.next/
+out/
+.vercel/
+
+# Local DB / uploads (runtime data)
+bot-backend/data/
+bot-backend/uploads/
+
+# Misc build artifacts
+coverage/
+dist/
+build/

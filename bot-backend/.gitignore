@@ -1,0 +1,13 @@
+# Backend-only ignores (root .gitignore also applies)
+.env
+.env.*
+!.env.example
+
+node_modules/
+
+# Runtime data (SQLite + downloaded media)
+data/
+uploads/
+
+*.log
+.DS_Store
