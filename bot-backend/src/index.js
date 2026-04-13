@@ -5,15 +5,24 @@ import { fileURLToPath } from 'url';
 import { Telegraf, Markup } from 'telegraf';
 import cron from 'node-cron';
 import { config } from './config.js';
+import { privateChatOnlyGuard } from './bot/guards.js';
+import { sendDigestToGroup, sendWeekStartNotification } from './bot/groupMessaging.js';
 import { getUserState, setUserState, resetUserState } from './bot/stateMachine.js';
 import { getAllTeams } from './db/teams.js';
-import { getUserByTelegramId, createUser, updateUserAvatar } from './db/users.js';
+import {
+  getUserByTelegramId,
+  createUser,
+  updateUserAvatar,
+  updateUserUsernameByTelegramId
+} from './db/users.js';
 import {
   getCurrentDigestPeriod,
   getNextPeriodForTeam,
+  getOpenPeriodForTeam,
   getPeriodById,
   closePeriod,
   publishPeriod,
+  markDigestPosted,
   openNextPeriod,
   getPeriodsToClose,
   getPeriodsToPublish
@@ -79,10 +88,51 @@ function formatStartDate(isoDate) {
 // --- Telegram bot bootstrap ---
 const bot = new Telegraf(config.telegramToken);
 
+// Global guard: ignore all group/supergroup/channel noise (admin /commands only).
+bot.use(privateChatOnlyGuard);
+
+// Serialize photo uploads per user+period+segment to avoid race conditions
+// when Telegram delivers multiple photos quickly (e.g. albums / media groups).
+const photoUploadLocks = new Map();
+async function withPhotoUploadLock(key, fn) {
+  const prev = photoUploadLocks.get(key) || Promise.resolve();
+  let release;
+  const next = new Promise((resolve) => {
+    release = resolve;
+  });
+  photoUploadLocks.set(key, prev.then(() => next));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    // Best-effort cleanup when no newer waiters are chained.
+    if (photoUploadLocks.get(key) === next) {
+      photoUploadLocks.delete(key);
+    }
+  }
+}
+
+function getMainMenuKeyboard() {
+  return Markup.keyboard([['Participate'], ['Help']]).resize();
+}
+
+async function sendMainMenu(ctx, text = null) {
+  const msg = text || 'Choose an action:';
+  await ctx.reply(msg, getMainMenuKeyboard());
+}
+
 // /start: ensure user exists; if new → registration flow. If existing but no avatar → require avatar.
 bot.start(async (ctx) => {
   const tgId = ctx.from.id;
   try {
+    if (ctx.from?.username) {
+      try {
+        await updateUserUsernameByTelegramId(tgId, String(ctx.from.username));
+      } catch {
+        // ignore username update errors
+      }
+    }
     const existing = await getUserByTelegramId(tgId);
     if (existing) {
       if (existing.avatar_url == null || existing.avatar_url === '') {
@@ -92,7 +142,7 @@ bot.start(async (ctx) => {
       }
       await resetUserState(tgId);
       await resetUserState(existing.id);
-      await ctx.reply('You are already registered. You can continue using the bot.');
+      await sendMainMenu(ctx, 'You are already registered. You can continue using the bot.');
       return;
     }
 
@@ -101,6 +151,30 @@ bot.start(async (ctx) => {
     await ctx.reply('Welcome to SME Digest! Please enter your first name:');
   } catch (err) {
     console.error('[bot] /start error', err);
+    await ctx.reply('Unexpected error. Please try again later.');
+  }
+});
+
+bot.command('help', async (ctx) => {
+  await sendMainMenu(
+    ctx,
+    'Main commands:\n- Participate: start/continue this week submission\n- /start: registration\n- /participate: same as Participate button'
+  );
+});
+
+bot.hears('Help', async (ctx) => {
+  await sendMainMenu(
+    ctx,
+    'Main commands:\n- Participate: start/continue this week submission\n- /start: registration\n- /participate: same as Participate button'
+  );
+});
+
+bot.hears('Participate', async (ctx) => {
+  const tgId = ctx.from.id;
+  try {
+    await handleParticipationOrNextWeek(ctx, tgId);
+  } catch (err) {
+    console.error('[bot] Participate button error', err);
     await ctx.reply('Unexpected error. Please try again later.');
   }
 });
@@ -118,6 +192,13 @@ bot.on('text', async (ctx, next) => {
 
   try {
     const user = await getUserByTelegramId(tgId);
+    if (user && ctx.from?.username && user.username !== ctx.from.username) {
+      try {
+        await updateUserUsernameByTelegramId(tgId, String(ctx.from.username));
+      } catch {
+        // ignore username update errors
+      }
+    }
     const stateKey = user ? user.id : tgId;
     const state = await getUserState(stateKey);
 
@@ -194,7 +275,10 @@ async function handleParticipationOrNextWeek(ctx, tgId) {
     return;
   }
 
-  const period = await getCurrentDigestPeriod();
+  let period = await getCurrentDigestPeriod();
+  if (!period && config.testModeAllowOpenPeriod) {
+    period = await getOpenPeriodForTeam(user.team_id);
+  }
   if (period && period.team_id === user.team_id) {
     if (isPastDeadline(period.end_date)) {
       await ctx.reply('The submission deadline for this week has passed.');
@@ -354,6 +438,13 @@ bot.on('photo', async (ctx) => {
       await ctx.reply('Please use /start to register first.');
       return;
     }
+    if (ctx.from?.username && user.username !== ctx.from.username) {
+      try {
+        await updateUserUsernameByTelegramId(tgId, String(ctx.from.username));
+      } catch {
+        // ignore username update errors
+      }
+    }
     const state = await getUserState(user.id);
 
     if (state.state === 'awaiting_avatar') {
@@ -365,7 +456,7 @@ bot.on('photo', async (ctx) => {
       await downloadTelegramPhoto(ctx.telegram, fileId, targetPath);
       await updateUserAvatar(user.id, avatarUrl);
       await resetUserState(user.id);
-      await ctx.reply('Registration completed successfully.');
+      await sendMainMenu(ctx, 'Registration completed successfully.');
       return;
     }
 
@@ -373,33 +464,37 @@ bot.on('photo', async (ctx) => {
     if (!periodId || (state.state !== 'lifestyle_photos' && state.state !== 'work_photos')) {
       return;
     }
-    const period = await getPeriodById(periodId);
-    if (period && isPastDeadline(period.end_date)) {
-      await ctx.reply('The submission deadline has passed.');
-      return;
-    }
     const isLifestyle = state.state === 'lifestyle_photos';
-    const count = isLifestyle
-      ? await countLifestylePhotos(user.id, periodId)
-      : await countWorkPhotos(user.id, periodId);
-    if (count >= 5) {
-      await ctx.reply('You can upload a maximum of 5 photos.');
-      return;
-    }
-    const photo = ctx.message.photo[ctx.message.photo.length - 1];
-    const fileId = photo.file_id;
-    const n = count + 1;
     const segment = isLifestyle ? 'lifestyle' : 'work';
-    const relPath = `period_${periodId}/user_${user.id}/${segment}_${n}.jpg`;
-    const targetPath = path.join(uploadsDir, relPath);
-    await downloadTelegramPhoto(ctx.telegram, fileId, targetPath);
-    const mediaUrl = `/uploads/${relPath}`;
-    if (isLifestyle) {
-      await insertLifestylePhoto(user.id, periodId, mediaUrl);
-    } else {
-      await insertWorkPhoto(user.id, periodId, mediaUrl);
-    }
-    await ctx.reply(`Photo ${n}/5 saved.`);
+    const lockKey = `${user.id}:${periodId}:${segment}`;
+
+    await withPhotoUploadLock(lockKey, async () => {
+      const period = await getPeriodById(periodId);
+      if (period && isPastDeadline(period.end_date)) {
+        await ctx.reply('The submission deadline has passed.');
+        return;
+      }
+      const count = isLifestyle
+        ? await countLifestylePhotos(user.id, periodId)
+        : await countWorkPhotos(user.id, periodId);
+      if (count >= 5) {
+        await ctx.reply('You can upload a maximum of 5 photos.');
+        return;
+      }
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      const fileId = photo.file_id;
+      const n = count + 1;
+      const relPath = `period_${periodId}/user_${user.id}/${segment}_${n}.jpg`;
+      const targetPath = path.join(uploadsDir, relPath);
+      await downloadTelegramPhoto(ctx.telegram, fileId, targetPath);
+      const mediaUrl = `/uploads/${relPath}`;
+      if (isLifestyle) {
+        await insertLifestylePhoto(user.id, periodId, mediaUrl);
+      } else {
+        await insertWorkPhoto(user.id, periodId, mediaUrl);
+      }
+      await ctx.reply(`Photo ${n}/5 saved.`);
+    });
   } catch (err) {
     console.error('[bot] photo handler error', err);
     await ctx.reply('Failed to save photo. Please try again.');
@@ -603,6 +698,7 @@ bot.action(/^team_(\d+)$/, async (ctx) => {
     if (!existing) {
       await createUser({
         telegram_id: tgId,
+        username: ctx.from?.username ? String(ctx.from.username) : null,
         first_name,
         last_name,
         team_id: teamId
@@ -650,6 +746,19 @@ async function runDigestLifecycle() {
   for (const period of toPublish) {
     await publishPeriod(period.id);
     console.log('[cron] Published digest period', period.id, period.year_month, 'week', period.week_index);
+
+    // Idempotent group post: only first caller sets digest_posted_at and posts.
+    try {
+      const posted = await markDigestPosted(period.id, nowISO);
+      if (posted) {
+        const publishedPeriod = await getPeriodById(period.id);
+        await sendDigestToGroup(bot.telegram, publishedPeriod);
+        console.log('[cron] Posted digest to group for period', period.id);
+      }
+    } catch (err) {
+      console.error('[cron] Failed to post digest to group for period', period.id, err);
+    }
+
     const next = await openNextPeriod(period.id);
     if (next) {
       console.log('[cron] Opened next period', next.id, next.year_month, 'week', next.week_index);
@@ -665,6 +774,22 @@ cron.schedule('*/5 * * * *', async () => {
     console.error('[cron] Digest lifecycle error', err);
   }
 });
+
+// Weekly notification: Monday 00:00 in explicit timezone (APP_TIMEZONE).
+cron.schedule(
+  '0 0 * * 1',
+  async () => {
+    try {
+      const period = await getCurrentDigestPeriod(new Date());
+      if (!period) return;
+      const botUsername = globalThis.__botUsername || null;
+      await sendWeekStartNotification(bot.telegram, period, botUsername);
+    } catch (err) {
+      console.error('[cron] Week start notification error', err);
+    }
+  },
+  { timezone: config.timezone }
+);
 
 // --- Startup ---
 async function start() {
@@ -684,6 +809,28 @@ async function start() {
 
   await bot.launch();
   console.log('Telegram bot started with long polling');
+
+  // Show commands list in Telegram UI (only in private chats).
+  try {
+    await bot.telegram.setMyCommands(
+      [
+        { command: 'start', description: 'Start / register' },
+        { command: 'participate', description: 'Participate in current week' },
+        { command: 'help', description: 'Show help and menu' }
+      ],
+      { scope: { type: 'all_private_chats' } }
+    );
+  } catch (err) {
+    console.warn('[startup] Failed to set bot commands', err);
+  }
+
+  try {
+    const me = await bot.telegram.getMe();
+    globalThis.__botUsername = me?.username || null;
+  } catch (err) {
+    console.warn('[startup] Failed to resolve bot username for deep link', err);
+    globalThis.__botUsername = null;
+  }
 
   // Graceful stop
   process.once('SIGINT', () => bot.stop('SIGINT'));

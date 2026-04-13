@@ -65,3 +65,21 @@ export async function getSubmittedByPeriodId(digestPeriodId) {
   );
   return stmt.all(digestPeriodId);
 }
+
+/**
+ * Active participants (users) who submitted in this period.
+ * Used for group mentions on digest publish.
+ * @param {number} digestPeriodId
+ * @returns {Promise<object[]>} user rows with telegram_id, username, first_name, last_name
+ */
+export async function getActiveSubmittedParticipantsByPeriodId(digestPeriodId) {
+  const stmt = await db.prepare(
+    `select u.telegram_id, u.username, u.first_name, u.last_name
+     from participation p
+     join users u on u.id = p.user_id
+     where p.digest_period_id = ?
+       and p.status = 'submitted'
+     order by p.submitted_at asc`
+  );
+  return stmt.all(digestPeriodId);
+}

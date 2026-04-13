@@ -96,6 +96,24 @@ export async function publishPeriod(periodId) {
 }
 
 /**
+ * Atomically mark that digest message was posted to group.
+ * Returns true if the marker was set by this call, false if it was already set.
+ * @param {number} periodId
+ * @param {string} postedAtISO
+ * @returns {Promise<boolean>}
+ */
+export async function markDigestPosted(periodId, postedAtISO) {
+  const stmt = await db.prepare(
+    `update digest_periods
+     set digest_posted_at = ?
+     where id = ? and digest_posted_at is null`
+  );
+  stmt.run(postedAtISO, periodId);
+  const after = await getPeriodById(periodId);
+  return after?.digest_posted_at === postedAtISO;
+}
+
+/**
  * Opens the next period: if current is (year_month, week N), opens (year_month, week N+1)
  * or first week of next month if N was 3. Never opens week 4. Creates the row if needed.
  * Sets status = 'open' if period exists but is not already open/published.
@@ -154,6 +172,22 @@ export async function getNextPeriodForTeam(teamId, afterDate = new Date()) {
      order by start_date asc limit 1`
   );
   return stmt.get(teamId, after);
+}
+
+/**
+ * Any currently open period for a team.
+ * Intended for test fallback when calendar-based current period is unavailable.
+ * @param {number} teamId
+ * @returns {Promise<object|undefined>}
+ */
+export async function getOpenPeriodForTeam(teamId) {
+  const stmt = await db.prepare(
+    `select * from digest_periods
+     where team_id = ? and status = 'open'
+     order by id desc
+     limit 1`
+  );
+  return stmt.get(teamId);
 }
 
 /**

@@ -120,6 +120,30 @@ async function initDb() {
     dbInstance.run('ALTER TABLE users ADD COLUMN avatar_url TEXT');
   }
 
+  // Safe migration: add username to users if column does not exist.
+  const pragmaUsers2 = dbInstance.prepare('PRAGMA table_info(users)');
+  let hasUsername = false;
+  while (pragmaUsers2.step()) {
+    const row = pragmaUsers2.getAsObject();
+    if (row.name === 'username') hasUsername = true;
+  }
+  pragmaUsers2.free();
+  if (!hasUsername) {
+    dbInstance.run('ALTER TABLE users ADD COLUMN username TEXT');
+  }
+
+  // Safe migration: add digest_posted_at to digest_periods if column does not exist.
+  const pragmaPeriods = dbInstance.prepare('PRAGMA table_info(digest_periods)');
+  let hasDigestPostedAt = false;
+  while (pragmaPeriods.step()) {
+    const row = pragmaPeriods.getAsObject();
+    if (row.name === 'digest_posted_at') hasDigestPostedAt = true;
+  }
+  pragmaPeriods.free();
+  if (!hasDigestPostedAt) {
+    dbInstance.run('ALTER TABLE digest_periods ADD COLUMN digest_posted_at TEXT');
+  }
+
   // Seed initial teams if empty.
   const result = dbInstance.exec('select count(*) as c from teams');
   const count =

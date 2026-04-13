@@ -12,7 +12,9 @@ export const config = {
   // Timezone used for month closing calculations, e.g. 'Europe/Moscow'
   timezone: process.env.APP_TIMEZONE || 'UTC',
   // Base URL of the public landing (for links sent to channel)
-  landingBaseUrl: process.env.LANDING_BASE_URL || 'https://example.com'
+  landingBaseUrl: process.env.LANDING_BASE_URL || 'https://example.com',
+  // Test-only fallback: allow using any team open period when calendar period is unavailable (e.g. month week 4).
+  testModeAllowOpenPeriod: process.env.TEST_MODE_ALLOW_OPEN_PERIOD === '1'
 };
 
 if (!config.telegramToken) {
